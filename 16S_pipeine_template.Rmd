@@ -1,0 +1,207 @@
+---
+title: "16S pipeline template"
+output: html_notebook
+---
+
+### This is a modifiable template for exploring and testing differential abundance between groups of samples using 16S amplicon sequencing data. In this example, we explore differences in the stool microbiota of mice sourced from Jackson Labs or Taconic Biosciecnces prior to intervention (Day -6). 
+
+#Load required packages
+```{r, echo=FALSE}
+library(phyloseq)
+library(ggplot2)
+library(tidyr)
+library(vegan)
+library(dplyr)
+library(ALDEx2)
+library(here)
+library(driver)
+library(ggbiplot)
+```
+
+# Get data together and pre-processed
+
+## Read in phyloseq
+```{r}
+ps <- readRDS(here::here("data/phyloseq_mouse.rds"))
+```
+
+## Build a phylogenetic tree for Unifrac distance
+```{r}
+set.seed(2)
+library("ape")
+random_tree = rtree(ntaxa(ps), rooted=TRUE, tip.label=taxa_names(ps))
+
+ps.t <- merge_phyloseq(ps, random_tree)
+```
+
+## Subset samples as appropriate. Here, all of Day == -6
+```{r}
+Dneg6.raw <- subset_samples(ps.t, Day == -6)
+
+example <- subset_samples(Dneg6.raw, Source == "Charles" | Source == "Taconic")
+```
+
+## Filter out samples with less than 5000 reads, and allow only taxa that appear 3 or more times in at least 10% of samples
+```{r}
+example.f <- prune_samples(sample_sums(example) >= 5000, example) %>% filter_taxa(function(x) sum(x > 3) > 0.2*length(x), TRUE)
+```
+
+# Community dissimilarity and differential abundance
+
+## Test community difference by permANOVA of factor (here, mouse source)
+```{r}
+#Unifrac
+UD <- UniFrac(example)
+conds <- sample_data(example)$Source
+PA <- adonis2(UD ~ conds, permutations = 500)
+PA
+```
+
+# Create biplot by factor (here, mouse source)
+
+## Convert counts to relative abundance
+```{r}
+example.f.ra <- transform_sample_counts(example.f, function(x) x/sum(x)) 
+```
+
+## Filter taxa that don't contribute at least 0.1% total relative abundance. 
+```{r}
+minTotRelAbun = 1e-4
+x = taxa_sums(example.f.ra)
+keepTaxa = which((x / sum(x)) > minTotRelAbun)
+prunedSet = prune_taxa(names(keepTaxa), example.f.ra)
+
+Fullmeta <- as.data.frame(as.matrix(sample_data(prunedSet)))
+
+```
+
+## Optionally agglomerate to a taxanomic rank
+```{r}
+Family.g <- tax_glom(prunedSet, taxrank = "Family")
+
+```
+
+## Function for iterating biplots
+```{r}
+plot_biplot <- function(ps, level, groups, title){
+  TAX1 = as(tax_table(ps), "matrix")
+  tax <- as.data.frame(TAX1)
+  tax <- data.frame(lapply(tax, as.character), stringsAsFactors=FALSE)
+  
+  otu <- as.data.frame(otu_table(ps))
+  colnames(otu) <- tax[,level]
+  otu$Other <- (1-rowSums(otu))
+  
+  sampleData <- as.data.frame(sample_data(ps))
+  OTU_counts <- t(otu)
+
+  data.clr <- apply(OTU_counts+0.65, 2, clr)
+  data.clr <- t(data.clr)
+  colnames(data.clr) <- colnames(otu)
+  fit <- stats::prcomp(data.clr)
+  ggbiplot(fit, groups=as.factor(sampleData[[groups]]), ellipse=T, varname.adjust = 1.5, varname.size = 3.5) +
+    ggtitle(title) +
+  # optional tuning parameter for compensating for varname.size above
+    xlim(-4,4) + 
+    ylim(-4,4) + 
+    theme_bw(base_size = 14) + 
+    theme(legend.position = c(.2,.2), legend.background = element_rect(fill = "white", colour = "black"))
+
+}
+```
+
+
+## Plot the biplot, selecting the appropriate agglomeration rank, the taxanomic level for label, the differentiating factor (here, source), and the title
+```{r}
+plot_biplot(Family.g, "Family", "Source", "Microbiota Structure:\nCharles vs Taconic Mice")
+
+#ggsave("~/Desktop/Taconic_vs_Jackson_Family_Biplot.png")
+```
+
+# Test differential abundance using ALDEx2 (DON'T use relative abundance)
+
+## Create DA function
+```{r}
+test_DA <- function(ps, tax_rank, groups){
+  agglom <- tax_glom(ps, taxrank = tax_rank)
+  
+  #extract data we need from phyloseq
+  agglom.asv <- t(otu_table(agglom))
+  agglom.sd <- sample_data(agglom)
+  agglom.tax <- tax_table(agglom)
+  
+  #fit aldex clr model for differential abundance
+  agglom.fit <- aldex.clr(agglom.asv, conds = as.vector(agglom.sd[[groups]]), mc.samples = 128, denom = "all")
+
+  #run statistical tests
+  agglom.tt <- aldex.ttest(agglom.fit)
+  
+  #calculate effect sizes and merge with prior
+  agglom.e <- aldex.effect(agglom.fit, verbose = TRUE)
+  agglom.tt.e <- merge(agglom.tt, agglom.e, by = 0, all = FALSE)
+  
+  #fiddle with rownames so merging works with taxa, then merge with taxa
+  row.names(agglom.tt.e) <- agglom.tt.e$Row.names
+  agglom.tt.e.tax <- merge(agglom.tt.e, agglom.tax, by = 0, all = FALSE)
+  agglom.tt.e.tax <- agglom.tt.e.tax[,c(-1)]
+  
+  #sort by BH corrected siginifance (absolute value)
+  agglom_sorted <- agglom.tt.e.tax[order(abs(agglom.tt.e.tax$wi.eBH)),]
+  
+  return(agglom_sorted)
+}
+```
+
+## Test differential abundance at desired taxanomic level and by desired factor
+```{r}
+test_DA(example, "Family", "Source")
+```
+
+
+
+# Hyptohesis generation with random forest approach to differential abundance (not statistical test)
+
+```{r, echo=FALSE}
+library(randomForest)
+library(caTools)
+```
+
+```{r}
+#set up data
+full_set <- as.data.frame(as.matrix(t(genus.asv)))
+
+#rename seqs as their genera
+taxa <- as.data.frame(as.matrix(tax_table(genus)))
+colnames(full_set) <- taxa$Genus
+names(full_set) <- make.names(names(full_set))
+
+#make source a factor so rf behaves
+full_set$Source <- genus.sd$Source
+full_set$Source <- as.factor(full_set$Source)
+
+#divide into train and test batches
+which = sample.split(full_set$Source, SplitRatio = .67)
+training_set = subset(full_set, which == TRUE)
+test_set  = subset(full_set, which == FALSE)
+
+#check relative lengths of train and test (should be 2:1)
+#nrow(training_set)
+#nrow(test_set)
+
+#build the classifier
+rf_model <- randomForest(
+  Source ~ .,
+  data=training_set
+)
+
+#test the classifier with test_set, minus the last column which is mouse source
+pred = predict(rf_model, newdata=test_set[-45,])
+
+#create the confusion matrix
+confmatrix = table(test_set[,45], pred)
+
+#view feature importance
+feats <- varImpPlot(rf_model, n.var = 15)
+
+```
+
